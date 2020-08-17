@@ -1,0 +1,450 @@
+---
+title: "F&B"
+author: "Valencia Lie"
+date: "17/08/2020"
+output: 
+  prettydoc::html_pretty:
+    theme: hpstr
+    highlight: github
+    toc: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+Customer behaviour, especially in food and beverage industry, is highly related to seasonality patterns. In this report, I will attempt to use time series analysis to provide a good forecast and seasonality explanation based on real-life data of the number of visitors that frequent an F&B store hourly.
+
+# Read data and preprocessing
+```{r warning=FALSE, message=FALSE}
+library(tidyverse)
+train <- read_csv("data/data-train.csv")
+test <- read_csv("data/data-test.csv")
+```
+
+We will inspect the dataset for missing data.
+
+```{r}
+glimpse(train)
+anyNA(train)
+```
+
+Since there is no missing data, we will move forward. According to the template of the test dataset, we can see that we are rounding all date to hourly, hence we will do that to our train dataset.
+
+Next, we will summarise the number of visitors based on the transaction date, just like the test dataset.
+
+```{r warning=FALSE, message=FALSE}
+library(lubridate)
+library(padr)
+train$transaction_date <- floor_date(train$transaction_date, unit = "hour")
+
+train_clean <- train %>% 
+  group_by(transaction_date) %>% 
+  distinct(receipt_number) %>% 
+  summarise(visitors = n())
+
+train_clean %>% 
+  pad() %>% 
+  is.na() %>% 
+  colSums()
+```
+
+Since there is NA in the visitors column, we will replace all the NA values with 0.01. The reason why we did not replace it with 0 is because we would want to do log transformation on it when we reach modelling (because the forecast data cannot fall below 0!). Hence, the only way we can tackle this issue is to replace it with a small number which hopefully will not interfere with the accuracy of our modelling and forecasting.
+
+```{r message=FALSE, warning=FALSE}
+train_clean <- train_clean %>% 
+  pad(start_val = min(train_clean$transaction_date), end_val = max(train_clean$transaction_date)) %>% 
+  replace_na(list(visitors =0.0000001))
+
+train_clean %>% 
+  pad() %>% 
+  is.na() %>% 
+  colSums()
+
+train_clean$transaction_date <- ymd_hms(train_clean$transaction_date)
+
+test$datetime <- floor_date(test$datetime, unit = "hour")
+
+test_clean <- test %>% 
+  pad(start_val = max(train_clean$transaction_date), end_val = max(test$datetime)) 
+
+test_clean <- test_clean %>% 
+  filter(!row_number() %in% 1)
+
+```
+After replacing all NA with 0, we checked the missing value once again and there is no missing value now.
+
+```{r warning=FALSE, message=FALSE}
+library(ggplot2)
+train_test <- train_clean %>% 
+  head(100)
+ggplot(train_test, aes(x = transaction_date, y = visitors)) +
+  geom_line() +
+  theme_minimal()
+```
+
+Based on the visualisation above, we can tell that there is daily seasonality because the pattern of the number of visitors repeats everyday.
+
+# Seasonality Analysis
+
+```{r warning=FALSE, message=FALSE}
+library(forecast)
+train_ts <- ts(train_clean$visitors, start = min(train_clean$transaction_date), end = max(train_clean$transaction_date), frequency = 24)
+```
+
+```{r}
+train_ts %>% 
+  tail(24*7*4) %>% 
+  decompose() %>% 
+  autoplot()
+```
+
+However, after plotting the decomposed data, we can tell that there is still a pattern on the trend. This allows us to know that the frequency is not accurate yet.
+
+But why is that? According to our visualisation above, we can tell that there is definitely a repetitive pattern daily, and hence logically frequency = 24, but why is that not the case? 
+My hypothesis claims that this data has multiple seasonality. Let's try to break it down further.
+
+I tried to decompose it using daily and weekly seasonality on the hourly data.
+
+```{r fig.height=8, fig.width=10}
+msts_train <- train_clean$visitors %>% 
+  msts(seasonal.periods = c(24,24*7))
+msts_train %>% 
+  head(24*7*4) %>% 
+  mstl() %>% 
+  autoplot()
+```
+
+From the decomposed visualisation above, we can tell that it is fully decomposed as the trend shows a decreasing trend without any seasonality left. 
+
+Let's go through each of the panels in the above visualisation.
+
+1. The first panel from the top is the original, observed time series. 
+2. The second panel from the top is the trend. After multiple decomposition, we can see that actually the data has a decreasing trend.
+3. The third panel is the daily seasonality (frequency = 24). As we can see, there is a repetitive pattern daily in our decomposed data.
+4. The fourth panel is the weekly seasonality (frequency = 24*7). As we can see, there is a repetitive pattern weekly (every 7 days) in our data.
+5. The fifth panel is the residuals/error component, which is determined by removing the trend and seasonal figure.
+
+For better visualisation on the daily and weekly seasonality component, I break down the graphs for both components of seasonality.
+
+```{r}
+#Daily seasonality
+msts_component <- msts_train %>% 
+  head(24*7*4) %>% 
+  mstl()
+msts_component[,3] %>% 
+  autoplot()
+```
+
+```{r}
+#Weekly seasonality
+msts_component <- msts_train %>% 
+  head(24*7*4) %>% 
+  mstl()
+msts_component[,4] %>% 
+  autoplot()
+```
+
+Logically, the third panel makes sense because in the context of an F&B outlet, there is bound to be more visitors during eating hours (such as 12pm or 6pm), regardless of the day, justifying the existence of a daily repetition/seasonality. Furthermore, the fourth panel makes sense too because there is bound to be more visitors on some days such as on weekends (if the F&B outlet is located in a mall) or on weekdays (if the F&B outlet is located in an office building). This justifies the existence of a weekly repetition/seasonality.
+
+# Cross Validation
+
+I will subset the last 1 month of data for forecasting and the rest for training. I do the cross validation after the time series analysis so that I do not need to make both the test and train data into time series objects but rather just do it once before splitting them up.
+
+```{r fig.width=10, fig.height=8, warning=FALSE, message=FALSE}
+library(MLmetrics)
+train_new <- head(msts_train, - 24*7)
+test_new <- tail(msts_train,  24*7)
+```
+
+# Model fitting
+## SMA
+Simple Moving Average (SMA) is a machine learning algorithm that forecasts future data by simply moving the average of the last n data before the data forecast. However, since this algorithm is only able to forecast using data that has no trend and seasonality, this algorithm is not suitable to be used on this dataset (which has both trend and seasonality).
+
+## SES, DES, TES
+Similar to SMA, Simple Exponential Smoothing (SES) is more suitable for dataset that has no trend and no seasonality. The only difference between SES and SMA is that SES gives different weightage to the data in the dataset (more weightage to newer data than older), whereas SMA gives equal weightage to all data, regardless of how old or new they are (hence how irrelevant or relevant they are to future data prediction). However, with that being said, SES is still not possible to be used for this dataset that has both trend and seasonality.
+
+Double Exponential Smoothing (DES or Holt) works just like SES. It gives different weightage to the data in the dataset. However, similar to SES, this algorithm is not suitable for dataset that has both trend and seasonality as it is only suitable for dataset that only has trend but no seasonality.
+
+Triple Exponential Smoothing (TES or Holt Winters), on the other hand, works well with this dataset because it is suitable for datasets that have both trend and seasonality.
+
+
+```{r}
+train_hw <- HoltWinters(train_new, gamma = 0.70)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(MLmetrics)
+hw_forecast <- forecast(train_hw, h = 24*7)
+MAE(hw_forecast$mean, test_new)
+```
+
+For this particular Holt Winters model, the mean absolute error of the prediction that the model generates is around 4.66. For clarity sake, we will try to make a visualisation of how far off (or how reliable) the prediction is to the true data.
+
+```{r fig.height=4, fig.width=8}
+train_new %>% 
+  autoplot(series = "actual train") +
+  autolayer(test_new, series = "test") +
+  autolayer(hw_forecast$mean, series = "Holt Winters predicted")
+```
+From the visualisation, we can tell that the predictions made by this particular model is not that accurate in forecasting because there are still several errors rendered that still be fixed.
+
+## ARIMA
+AutoRegressive Integrated Moving Average (ARIMA) is a powerful algorithm that allows us to forecast future data better and more reliable. It adopts 2 methods: the moving average method that we previously have seen in SMA and also autoregressive method that we have seen in linear regression models before. However, this method does not work well with this particular dataset because ARIMA does not work well with dataset that has a seasonality.
+
+## SARIMA
+Hence, to tackle the above problem, we use Seasonal ARIMA (SARIMA). SARIMA adopts the same approach as ARIMA, though it does tackle the seasonality aspect in a different way. It does differencing to the dataset to remove the trend and seasonality of the dataset in order to strip the data to its bare minimum, allowing for easier computation.
+
+```{r message=FALSE, warning=FALSE}
+library(tseries)
+adf.test(train_new)
+```
+H0: Data is not stationary
+
+H1: Data is stationary
+
+First of all, before we do differencing, we will have to do an ADF test on the dataset to see whether the data is stationary enough or not (stationary = no trend and no seasonality). However, according to the above p-value, since the p-value is < 0.05, we reject H0 and accept H1, meaning that we accept that the data is stationary.
+
+To be very sure, we will conduct KPSS test to know for sure whether the data is stationary or not.
+
+```{r}
+kpss.test(train_new)
+```
+H0: Data is stationary
+
+H1: Data is not stationary
+
+According to the above p-value, the p-value is above 0.05, making us accept H0 and believe that the data is stationary. 
+
+Hence, we don't have to do differencing to the data and can proceed with the fitting of SARIMA.
+
+### Fitting with SARIMA automatically
+```{r}
+train_auto <- auto.arima(train_new, seasonal = T)
+summary(train_auto)
+```
+According to the model auto generated, the 'best' SARIMA model is ARIMA(2,0,1)(0,1,0)[168]. However, we will try to compare it if with do the SARIMA model manually.
+
+### Fitting with SARIMA manually
+A typical SARIMA model index is ARIMA(p,d,q)(P,D,Q)[frequency].
+
+```{r fig.width=15, fig.height=10}
+tsdisplay(train_new)
+```
+Based on the above visualisation,
+PACF
+SARIMA: it seems that the PACF spikes at lags of multiples of 24 and 168 due to the small scale (P)
+ARIMA : PACF spikes at lag 1.  (p)
+
+ACF 
+SARIMA : it seems that the ACF spikes at lags of multiples of 24 and 168 (Q)
+ARIMA : it is difficult to see as well but ACF spikes at around lag 1. (q)
+
+We will hence try to build a model with the index ARIMA(1,0,1)(0,0,0)[168], ARIMA(1,0,1)(0,0,0)[24] and ARIMA(1,0,1)(0,1,0)[168] and compare it with the auto generated model.
+
+```{r}
+library(forecast)
+train_sarima1 <- Arima(y = train_new, order = c(1,0,1), seasonal = list(order = c(0,0,0), period = 168))
+train_sarima2 <- Arima(y = train_new, order = c(1,0,1), seasonal = list(order = c(0,0,0), period = 24)) 
+train_sarima3 <- Arima(y = train_new, order = c(1,0,1), seasonal = list(order = c(0,1,0), period = 168)) 
+```
+
+```{r}
+summary(train_sarima1)
+summary(train_sarima2)
+summary(train_sarima3)
+```
+
+According to the summary of each model, the auto generated SARIMA model has a MAE of 3.93. On the other hand, the first manually built SARIMA model has a MAE of 6.32, the second manually built SARIMA model has a MAPE of 6.32 and the third manually built SARIMA model has a MAPE of 3.85.
+
+However, this is only accurate if it is predicting the train dataset. Let's forecast it to the test dataset and see the MAPE of each model.
+
+```{r}
+auto_forecast <- forecast(object = train_auto, h = 24*7)
+sarima1_forecast <- forecast(object = train_sarima1, h = 24*7)
+sarima2_forecast <- forecast(object = train_sarima2, h = 24*7)
+sarima3_forecast <- forecast(object = train_sarima3, h = 24*7)
+```
+
+```{r}
+MAE(auto_forecast$mean, test_new)
+MAE(sarima1_forecast$mean, test_new)
+MAE(sarima2_forecast$mean, test_new)
+MAE(sarima3_forecast$mean, test_new)
+```
+From the above calculation, we can tell that the best model out of the 4 is the third manually built SARIMA model with a MAE of 4.55.
+
+```{r fig.height=4, fig.width=8}
+train_new %>% 
+  autoplot(series = "actual train") +
+  autolayer(test_new, series = "actual test") +
+  autolayer(auto_forecast$mean, series = "auto SARIMA predicted") +
+  autolayer(sarima1_forecast$mean, series = "SARIMA 1 predicted") +
+  autolayer(sarima2_forecast$mean, series = "SARIMA 2 predicted") +
+  autolayer(sarima3_forecast$mean, series = "SARIMA 3 predicted")
+```
+
+With the above visualisation, we can easily tell the best SARIMA models out of the four. The third manually built SARIMA model was able to predict future data better than the other two (clearly pinpointing when is the peak mean temperature and when is the trough).
+
+## STLM
+STLM is a method of forecasting that combines STL (Seasonal and Trend decomposition using Loess) decomposition with method of forecasting. (exponential smoothing, ARIMA, etc)
+
+However, one very big downside to STLM is that it is unable to process data that is multiplicative (unless we do log transformation to it). Thankfully, our dataset is additive, so there will be no problem using STLM on our dataset.
+
+```{r fig.height=4, fig.width=8}
+stlm_model <- train_new %>%
+  stlm() %>% 
+  forecast(h = 24*7) 
+plot(stlm_model)
+
+train_new %>% 
+  autoplot(series = "actual train") +
+  autolayer(test_new, series = "test") +
+  autolayer(stlm_model$mean, series = "STLM without log predicted")
+MAE(stlm_model$mean, test_new)
+```
+
+Based on the above calculation, the STLM model generates a MAE of 5.16. Although this error is small enough, interestingly, as we inspect the visualisation, we can see that the forecast data falls below 0. Since it is impossible to have the number of visitors to fall below 0, we need to do log transformation to our data so that the forecast data is positive.
+
+
+```{r fig.height=4, fig.width=8}
+train_stlm1 <- stlm(y = train_new, lambda = 0)
+stlm_forecast1 <- forecast(train_stlm1, h = 24*7)
+train_new %>% 
+ autoplot(series = "actual train") +
+autolayer(test_new, series = "actual test") +
+  autolayer(stlm_forecast1, series = "STLM with log predicted")
+
+MAE(stlm_forecast1$mean, test_new)
+```
+However, as we can see from the visualisation and from the MAE, this model is very good in forecasting future data as the MAE is very low.
+
+## TBATS Model
+TBATS model is Trigonometric Seasonal + Exponential Smoothing Method + Box-Cox Transformation + ARMA model for residuals.
+Seasonality is allowed to change slowly over time in a TBATS model. This is different from a harmonic regression terms as it forces the seasonal patterns to repeat periodically without changing. However, the amount of time needed to estimate using TBATS is long.
+
+
+```{r fig.height=4, fig.width=8}
+tbats_mod <- train_new %>%
+            tbats(use.box.cox = FALSE, 
+                  use.trend = TRUE, 
+                  use.damped.trend = TRUE)
+tbats_model <-  forecast(tbats_mod,h=24*7) 
+
+train_new %>% 
+ autoplot(series = "actual train") +
+autolayer(test_new, series = "actual test") +
+  autolayer(tbats_model, series = "TBATS predicted")
+
+MAE(tbats_model$mean, test_new)
+```
+
+The TBATS yields an MAE of 5.23. While it is not the worst, it is still far from the best (3.72).
+
+
+# Evaluation of model and comparison
+
+## MAE 
+Based on the MAE of all the models, the winner is the stlm model (that has undergone log transformation) because it has the lowest MAE (3.72).
+
+## Asumptions
+
+### No autocorrelation between errors
+We will try to see whether our best model is able to fulfill all assumptions.
+
+```{r}
+Box.test(train_stlm1$residuals)
+```
+
+H0: no-autocorrelation 
+
+H1: autocorrelation 
+
+Since the p-value of the test is more than 0.05. We reject H1 and accept H0. Hence, it can be said that this model has no autocorrelation between errors. 
+
+### Why do we want no autocorrelation between errors?
+We want no autocorrelation between errors because the moment errors have autocorrelation with each other, we should minimise these errors because 1 error lead to another, which can be severely detrimental to our model as well as our forecasting results. 
+
+### Normality of error
+
+```{r}
+shapiro.test(train_stlm1$residuals)
+```
+
+H0: residuals are distributed normally
+
+H1: residuals not distributed normally
+
+Since the p-value of the test is less than 0.05. We reject H0 and accept H1. Hence, it can be said that the residuals are not distributed normally. 
+
+### Why do we want errors that follow a normal distribution?
+When errors of a model follow a standard normal distribution, its mean will be at 0 and the majority of the data of the error will be close to 0, making the model more reliable as the error will statistically be close to 0. Hence, we will try to make sure that the errors of our model follow a close resemblance of a normal distribution.
+
+# Tuning
+Although the STLM model fares the best amongst all models, we will still try to tune the model because the STLM model is unable to fulfill 1 out of the 2 assumptions. Hence, we will try to use a different model.
+
+## Seasonal Naive Model
+
+```{r fig.height=4, fig.width=8}
+train_naive <- snaive(train_new, h = 24*7, lambda = 0)
+
+naive_forecast <- forecast(train_naive)
+train_new %>% 
+  autoplot(series = "actual train") +
+  autolayer(test_new, series = "actual test") +
+  autolayer(naive_forecast, series = "NAIVE predicted")
+
+MAE(naive_forecast$mean, test_new)
+```
+```{r}
+shapiro.test(naive_forecast$residuals)
+```
+However, similarly with the previous models, it is still unable to fulfill the normality of error assumption. Since the previous STLM model still fares better than this one, we will use the STLM model as our final model.
+
+# Prediction of test dataset
+```{r}
+train_stlm2 <- stlm(y = msts_train, lambda = 0)
+stlm_forecastneww <- forecast(train_stlm2, h = 167)
+test_clean$visitor <- stlm_forecastneww$mean
+test_cleanNEW <- test_clean[ test_clean$datetime %in% test$datetime, ]
+
+write_csv(test_cleanNEW, "test_cleanNEW.csv")
+```
+
+According to the leaderboard in https://algoritma.shinyapps.io/leaderboard_capsml/, my model has achieved MAE of 4.91.
+
+# Conclusion
+
+According to all the models I have made, the best is still the STLM model that has undergone log transformation. However, with that being said, there is still some caveat: it is far from perfect. In fact, it is unable to have errors that are normally distributed. 
+
+## Why do we have errors that do not follow a normal distribution and what can we do about it?
+We have errors that do not follow a normal distribution probably because of outliers, multiple distribution in the data and insufficient data. Outliers can cause your data the become skewed and the mean of the data is especially sensitive to outliers. 
+Multiple distributions may be combined in your data, giving the appearance of a bimodal or multimodal distribution, causing the model's residuals to not follow a normal distribution. Insufficient data may also cause a normal distribution to look completely scattere
+
+In order for the errors to follow a normal distribution, we may need to:
+- Remove outliers (very high or very low data)
+- Increase sample size
+
+## When is the highest number of visitors based on seasonality
+
+```{r}
+ggplot(train_clean %>% 
+         head(72), aes(x = transaction_date, y = visitors)) +
+  geom_line() +
+  theme_minimal()
+```
+
+Based on the above visualisation, we can tell that based on the daily seasonality, the highest number of visitors is usually around 7-9 pm.
+
+
+```{r}
+ggplot(train_clean %>% 
+         head(24*7*3), aes(x = transaction_date, y = visitors)) +
+  geom_line() +
+  theme_minimal()
+```
+
+Moreover, we can also tell that based on the weekly seasonality, the highest number of visitors is usually Saturdays. Although the above graph shows that on the first week there are a lot of customers on Tuesdays, it is merely an anomaly because as we can see in the second week and third week, the number of visitors on Tuesday is actually quite low.
