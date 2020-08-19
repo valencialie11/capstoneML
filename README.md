@@ -2,7 +2,6 @@
 
 ## Dependencies
 - MLmetrics
-- Forecast
 - tseries
 - forecast
 - tidyverse
